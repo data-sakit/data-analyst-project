@@ -1,180 +1,154 @@
 import pandas as pd
 import numpy as np
 import sqlite3
-import gzip
+import os
 
 # ============================================================
-# STEP 1: LOAD DATA FROM DATABASE
+# STEP 1 — LOAD DATA FROM SQLITE AND SAVE TO data_raw/
 # ============================================================
 
-path = r'C:\Users\lenovo\Desktop\skillbox\d_a\result_data\shop_database.db'
-conn = sqlite3.connect(path)
+def load_data_from_sqlite(db_path, save_dir="data_raw"):
+    os.makedirs(save_dir, exist_ok=True)
 
-# Check tables
-query_tables = "SELECT NAME FROM sqlite_master WHERE type='table'"
-tables = pd.read_sql(query_tables, conn)
-print("Tables in database")
-print(tables)
+    conn = sqlite3.connect(db_path)
 
-# Load first 5 rows
-df_purchases_5r = pd.read_sql("select * from purchases limit 5", conn)
-df_coeffs_5r = pd.read_sql("select * from personal_data_coeffs limit 5", conn)
-df_personal_5r = pd.read_sql("select * from personal_data limit 5", conn)
+    df_purchases = pd.read_sql("SELECT * FROM purchases", conn)
+    df_coeffs = pd.read_sql("SELECT * FROM personal_data_coeffs", conn)
+    df_personal = pd.read_sql("SELECT * FROM personal_data", conn)
 
-# Load full tables
-df_purchases = pd.read_sql("select * from purchases", conn)
-df_coeffs = pd.read_sql("select * from personal_data_coeffs", conn)
-df_personal = pd.read_sql("select * from personal_data", conn)
+    conn.close()
 
-print("Basic information about tables:")
-print("\npurchases shape:", df_purchases.shape)
-print("personal_data_coeffs shape:", df_coeffs.shape)
-print("personal_data shape:", df_personal.shape)
+    df_purchases.to_csv(f"{save_dir}/purchases.csv", index=False)
+    df_coeffs.to_csv(f"{save_dir}/personal_data_coeffs.csv", index=False)
+    df_personal.to_csv(f"{save_dir}/personal_data.csv", index=False)
 
-conn.close()
+    print("✓ Step 1 completed: raw tables saved.")
+    return df_purchases, df_coeffs, df_personal
+
 
 # ============================================================
-# STEP 2: FILTER BY COUNTRY
+# STEP 2 — FILTER AND CLEAN DATA
 # ============================================================
 
-print("\nInitial counts:")
-print(f"Unique customers in personal_data: {df_personal['id'].nunique()}")
-print(f"Unique customers in personal_data_coeffs: {df_coeffs['id'].nunique()}")
-print(f"Unique customers in purchases: {df_purchases['id'].nunique()}")
+def filter_and_clean(df_purchases, df_coeffs, df_personal):
+    # Filter by country = 32
+    df_personal = df_personal[df_personal["country"] == 32].copy()
+    ids = df_personal["id"].tolist()
 
-print("\nFiltering personal_data: keeping only country = 32")
-before_filter = df_personal.shape[0]
-df_personal_filtered = df_personal[df_personal['country'] == 32]
-after_filter = df_personal_filtered.shape[0]
+    df_coeffs = df_coeffs[df_coeffs["id"].isin(ids)].copy()
+    df_purchases = df_purchases[df_purchases["id"].isin(ids)].copy()
 
-print(f"Before filter: {before_filter} rows")
-print(f"After filter: {after_filter} rows")
-print(f"Removed: {before_filter - after_filter} rows")
+    # Fix missing colours
+    df_purchases["colour"] = df_purchases["colour"].fillna("unknown")
 
-filtered_customer_ids = df_personal_filtered['id'].tolist()
-df_coeffs_filtered = df_coeffs[df_coeffs["id"].isin(filtered_customer_ids)]
-df_purchases_filtered = df_purchases[df_purchases['id'].isin(filtered_customer_ids)]
+    # Simplify colours
+    df_purchases["colour_simple"] = df_purchases["colour"].apply(
+        lambda x: x.split("/")[0] if "/" in str(x) else x
+    )
 
-# ============================================================
-# STEP 3: CLEANING AND FIXING MISSING VALUES
-# ============================================================
+    # Fix product_sex
+    mode_sex = df_purchases["product_sex"].mode()[0]
+    df_purchases["product_sex"] = df_purchases["product_sex"].fillna(mode_sex)
 
-df_personal_clean = df_personal_filtered.copy()
-df_coeffs_clean = df_coeffs_filtered.copy()
-df_purchases_clean = df_purchases_filtered.copy()
+    # Fix negative costs
+    df_purchases.loc[df_purchases["cost"] < 0, "cost"] = abs(
+        df_purchases.loc[df_purchases["cost"] < 0, "cost"]
+    )
 
-# Fill missing colours
-df_purchases_clean['colour'] = df_purchases_clean['colour'].fillna('unknown')
+    # Fix ac_coef = -inf
+    df_coeffs["ac_coef"] = df_coeffs["ac_coef"].replace(float("-inf"), np.nan)
+    ac_median = df_coeffs["ac_coef"].dropna().median()
+    df_coeffs["ac_coef"] = df_coeffs["ac_coef"].fillna(ac_median)
 
-# Simplify colours
-df_purchases_clean['colour_simple'] = df_purchases_clean['colour'].apply(
-    lambda x: x.split('/')[0] if '/' in str(x) else x
-)
+    print("✓ Step 2 completed: data filtered and cleaned.")
+    return df_purchases, df_coeffs, df_personal
 
-# Fill missing product_sex
-product_sex_mode = df_purchases_clean['product_sex'].mode()[0]
-df_purchases_clean['product_sex'] = df_purchases_clean['product_sex'].fillna(product_sex_mode)
-
-# Fix negative costs
-df_purchases_clean.loc[df_purchases_clean['cost'] < 0, 'cost'] = abs(
-    df_purchases_clean.loc[df_purchases_clean['cost'] < 0, 'cost']
-)
-
-# Fix -inf in ac_coef
-df_coeffs_clean['ac_coef'] = df_coeffs_clean['ac_coef'].replace(float('-inf'), np.nan)
-ac_coef_median = df_coeffs_clean['ac_coef'].dropna().median()
-df_coeffs_clean['ac_coef'] = df_coeffs_clean['ac_coef'].fillna(ac_coef_median)
 
 # ============================================================
-# STEP 4: MERGE TABLES AND CREATE FEATURES
+# STEP 3 — MERGE TABLES AND BUILD CUSTOMER FEATURES
 # ============================================================
 
-df_merged = pd.merge(df_personal_clean, df_coeffs_clean, on='id', how='inner')
+def build_customers(df_purchases, df_coeffs, df_personal, save_dir="data_processed"):
+    os.makedirs(save_dir, exist_ok=True)
 
-customer_purchases = df_purchases_clean.groupby('id').agg({
-    'product': 'count',
-    'cost': 'sum',
-    'base_sale': 'mean',
-    'product_sex': 'mean',
-    'dt': ['min', 'max']
-})
+    # Merge personal + coeffs
+    df_merged = pd.merge(df_personal, df_coeffs, on="id", how="inner")
 
-customer_purchases.columns = [
-    'total_purchases',
-    'total_spent',
-    'discount_rate',
-    'avg_product_sex',
-    'first_purchase_day',
-    'last_purchase_day'
-]
+    # Aggregate purchases
+    customer_purchases = df_purchases.groupby("id").agg({
+        "product": "count",
+        "cost": "sum",
+        "base_sale": "mean",
+        "product_sex": "mean",
+        "dt": ["min", "max"]
+    })
 
-customer_purchases = customer_purchases.reset_index()
+    customer_purchases.columns = [
+        "total_purchases",
+        "total_spent",
+        "discount_rate",
+        "avg_product_sex",
+        "first_purchase_day",
+        "last_purchase_day"
+    ]
 
-df_final = pd.merge(df_merged, customer_purchases, on='id', how='left')
+    customer_purchases = customer_purchases.reset_index()
 
-df_final['total_purchases'] = df_final['total_purchases'].fillna(0)
-df_final['total_spent'] = df_final['total_spent'].fillna(0)
-df_final['discount_rate'] = df_final['discount_rate'].fillna(0)
-df_final['avg_product_sex'] = df_final['avg_product_sex'].fillna(0.5)
-df_final['first_purchase_day'] = df_final['first_purchase_day'].fillna(-1)
-df_final['last_purchase_day'] = df_final['last_purchase_day'].fillna(-1)
+    # Merge with main table
+    df_final = pd.merge(df_merged, customer_purchases, on="id", how="left")
 
-# ============================================================
-# STEP 5: SAVE customers_final.csv
-# ============================================================
+    # Fill missing values for customers without purchases
+    df_final["total_purchases"] = df_final["total_purchases"].fillna(0)
+    df_final["total_spent"] = df_final["total_spent"].fillna(0)
+    df_final["discount_rate"] = df_final["discount_rate"].fillna(0)
+    df_final["avg_product_sex"] = df_final["avg_product_sex"].fillna(0.5)
+    df_final["first_purchase_day"] = df_final["first_purchase_day"].fillna(-1)
+    df_final["last_purchase_day"] = df_final["last_purchase_day"].fillna(-1)
 
-df_final.to_csv(
-    r'C:\Users\lenovo\Desktop\skillbox\d_a\result_data\customers_final.csv',
-    index=False
-)
+    # Save final dataset
+    df_final.to_csv(f"{save_dir}/customers_final.csv", index=False)
 
-# ============================================================
-# STEP 6: LOAD ADDITIONAL personal_data.csv.gz
-# ============================================================
+    print("✓ Step 3 completed: customers_final.csv saved.")
+    return df_final
 
-df_additional = pd.read_csv(
-    r'C:\Users\lenovo\Desktop\skillbox\d_a\personal_data.csv.gz',
-    compression='gzip'
-)
-
-df_additional.to_csv(
-    r'C:\Users\lenovo\Desktop\skillbox\d_a\result_data\df_additional.csv',
-    index=False
-)
 
 # ============================================================
-# STEP 7: PREPARE DATA FOR BINARY CLASSIFICATION
+# STEP 4 — LOAD ADDITIONAL personal_data.csv.gz
 # ============================================================
 
-print("=" * 60)
-print("STEP 7: PREPARING DATA FOR BINARY CLASSIFICATION")
-print("=" * 60)
+def load_additional_data(gz_path, save_dir="data_processed"):
+    os.makedirs(save_dir, exist_ok=True)
 
-gender_dist = df_final['gender'].value_counts()
+    df_additional = pd.read_csv(gz_path, compression="gzip")
+    df_additional.to_csv(f"{save_dir}/df_additional.csv", index=False)
 
-common_features = ['age', 'education', 'city', 'country']
+    print("✓ Step 4 completed: df_additional.csv saved.")
+    return df_additional
 
-x_train_common = df_final[common_features].copy()
-y_train = df_final['gender'].copy()
-x_test = df_additional[common_features].copy()
 
-from sklearn.preprocessing import OneHotEncoder
+# ============================================================
+# MAIN EXECUTION
+# ============================================================
 
-encoder = OneHotEncoder(sparse_output=False, drop='first')
+if __name__ == "__main__":
+    print("=== RUNNING DATA PREPARATION PIPELINE ===")
 
-education_encoded_train = encoder.fit_transform(x_train_common[['education']])
-education_encoded_test = encoder.transform(x_test[['education']])
+    # Step 1
+    df_purchases, df_coeffs, df_personal = load_data_from_sqlite(
+        r"C:\Users\lenovo\Desktop\skillbox\d_a\result_data\shop_database.db"
+    )
 
-x_train_encoded = x_train_common.drop('education', axis=1)
-x_test_encoded = x_test.drop('education', axis=1)
+    # Step 2
+    df_purchases, df_coeffs, df_personal = filter_and_clean(
+        df_purchases, df_coeffs, df_personal
+    )
 
-col_name = encoder.get_feature_names_out()[0]
+    # Step 3
+    df_final = build_customers(df_purchases, df_coeffs, df_personal)
 
-x_train_encoded[col_name] = education_encoded_train[:, 0]
-x_test_encoded[col_name] = education_encoded_test[:, 0]
+    # Step 4
+    load_additional_data(
+        r"C:\Users\lenovo\Desktop\skillbox\d_a\personal_data.csv.gz"
+    )
 
-x_train_encoded.to_csv('X_train_prepared.csv', index=False)
-x_test_encoded.to_csv('X_test_prepared.csv', index=False)
-y_train.to_csv('y_train.csv', index=False)
-
-print("Prepared datasets saved.")
+    print("=== DATA PREPARATION COMPLETED ===")
