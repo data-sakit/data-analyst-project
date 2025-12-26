@@ -1,0 +1,32 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+env/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Data folders (we keep only raw + processed)
+data_raw/*.db
+data_raw/*.csv
+data_raw/*.txt
+data_raw/*.gz
+
+# Allow only structure, not actual data
+!data_raw/.gitkeep
+!data_processed/.gitkeep
+
+# Logs
+*.log
+
+# VS Code
+.vscode/
